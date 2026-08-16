@@ -5,7 +5,7 @@ XMOL 期刊新文献监控 + 开放获取(OA)下载 + 本地 PDF 整理
 
 三个功能：
   1. fetch     通过 XMOL 检索接口抓取指定期刊的最新文献（标题/作者/DOI/摘要链接）
-  2. download  在 fetch 基础上，按 DOI 查询 Unpaywall，仅下载开放获取 PDF
+  2. download  抓取每个期刊最新更新日期的 Article，去重后按 DOI 查 Unpaywall，仅下载 OA PDF
   3. organize  整理本地已合法下载的 PDF（按期刊/年份归类并规范化命名）
 
 依赖：见 requirements.txt
@@ -77,6 +77,44 @@ def get_proxies(cfg):
     if "://" not in p:
         p = "http://" + p
     return {"http": p, "https": p}
+
+
+def load_seen(cfg):
+    """读取已处理过的 DOI 集合（跨周去重）。"""
+    path = Path(cfg.get("seen_file", "seen.json"))
+    if path.exists():
+        try:
+            with path.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, list):
+                return set(data)
+            if isinstance(data, dict):
+                return set(data.get("dois", []))
+        except (json.JSONDecodeError, TypeError):
+            pass
+    return set()
+
+
+def save_seen(cfg, seen):
+    path = Path(cfg.get("seen_file", "seen.json"))
+    path.write_text(json.dumps(sorted(seen), ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def load_index(path="papers_index.json"):
+    p = Path(path)
+    if p.exists():
+        try:
+            with p.open("r", encoding="utf-8") as f:
+                data = json.load(f)
+            if isinstance(data, dict):
+                return data
+        except (json.JSONDecodeError, TypeError):
+            pass
+    return {}
+
+
+def save_index(index, path="papers_index.json"):
+    Path(path).write_text(json.dumps(index, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
 def safe_filename(name):
@@ -224,6 +262,17 @@ def fetch_xmol_papers(cfg, journal, keyword="", days=7, pages=3, debug=False, pr
     return uniq, None
 
 
+def keep_latest_date(papers):
+    """只保留 pub_date 最新（最大）的那一批文献。"""
+    if not papers:
+        return papers
+    dates = [p.get("pub_date") for p in papers if p.get("pub_date")]
+    if not dates:
+        return papers
+    latest = max(dates)
+    return [p for p in papers if p.get("pub_date") == latest]
+
+
 # --------------------------------------------------------------------------- #
 # 2. 开放获取查询与下载（Unpaywall）
 # --------------------------------------------------------------------------- #
@@ -234,6 +283,19 @@ def query_unpaywall(doi, email, proxies=None):
         resp = requests.get(url, params=params, headers=HEADERS, timeout=30, proxies=proxies)
         if resp.status_code == 200:
             return resp.json()
+    except requests.RequestException:
+        pass
+    return None
+
+
+def query_openalex_type(doi, email="", proxies=None):
+    """按 DOI 查询 OpenAlex，返回文献类型（article / review / editorial / letter ...）。"""
+    url = f"https://api.openalex.org/works/https://doi.org/{doi}"
+    params = {"mailto": email} if email else None
+    try:
+        r = requests.get(url, params=params, headers=HEADERS, timeout=30, proxies=proxies)
+        if r.status_code == 200:
+            return r.json().get("type")
     except requests.RequestException:
         pass
     return None
@@ -377,7 +439,10 @@ def cmd_download(args):
     dl_dir = Path(cfg.get("download_dir", "downloads"))
     dl_dir.mkdir(parents=True, exist_ok=True)
 
-    all_papers = []
+    seen = load_seen(cfg)
+    index = load_index()
+    results = []
+
     for journal in cfg.get("journals", []):
         print(f"[download] 期刊：{journal}")
         papers, err = fetch_xmol_papers(
@@ -391,17 +456,43 @@ def cmd_download(args):
         if err:
             print(f"  [错误] {err}")
             continue
-        all_papers.extend(papers)
 
-    index = {}
-    results = []
-    for i, p in enumerate(all_papers, 1):
-        doi = p["doi"]
-        print(f"[{i}/{len(all_papers)}] {p['title'][:50]}")
-        item = dict(p)
-        item.update({"is_oa": False, "pdf_url": None, "downloaded": False, "file": None})
+        # 只保留该期刊最新更新日期的文献
+        papers = keep_latest_date(papers)
+        latest = papers[0]["pub_date"] if papers else "无"
+        print(f"  最新日期 {latest}：{len(papers)} 篇")
 
-        if doi:
+        for p in papers:
+            item = dict(p)
+            item.update({
+                "skip_reason": None,
+                "article_type": None,
+                "is_oa": False,
+                "pdf_url": None,
+                "downloaded": False,
+                "file": None,
+            })
+
+            doi = p["doi"]
+            if not doi:
+                item["skip_reason"] = "no_doi"
+                results.append(item)
+                continue
+            if doi in seen:
+                item["skip_reason"] = "duplicate"
+                results.append(item)
+                continue
+
+            # 只要 Article 类型
+            item["article_type"] = query_openalex_type(doi, email, proxies=proxies)
+            if item["article_type"] and item["article_type"] != "article":
+                item["skip_reason"] = f"not_article:{item['article_type']}"
+                results.append(item)
+                seen.add(doi)  # 非 Article 也记入 seen，下次不再查
+                continue
+
+            print(f"  [{p['pub_date']}] {p['title'][:60]}")
+
             data = query_unpaywall(doi, email, proxies=proxies)
             if data:
                 pdf_url = pick_pdf_url(data)
@@ -421,24 +512,25 @@ def cmd_download(args):
                     print(f"    -> 开放获取：{pdf_url}")
             else:
                 print("    -> Unpaywall 查询失败")
+
+            seen.add(doi)
             index[doi] = {
                 "title": p["title"],
                 "journal": p["journal"],
                 "pub_date": p["pub_date"],
             }
+            results.append(item)
             time.sleep(1)
-        else:
-            print("    -> 无 DOI，跳过")
-        results.append(item)
 
-    Path("papers_index.json").write_text(
-        json.dumps(index, ensure_ascii=False, indent=2), encoding="utf-8")
+    save_seen(cfg, seen)
+    save_index(index)
     Path("results.json").write_text(
         json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
 
     n_ok = sum(1 for r in results if r["downloaded"])
-    print(f"\n完成：共 {len(results)} 篇，其中下载成功 {n_ok} 篇。")
-    print("索引已写入 papers_index.json，结果写入 results.json")
+    n_skip = sum(1 for r in results if r["skip_reason"])
+    print(f"\n完成：处理 {len(results)} 篇，下载成功 {n_ok} 篇，跳过 {n_skip} 篇。")
+    print("去重记录已写入 seen.json，索引已写入 papers_index.json")
 
 
 def cmd_organize(args):

@@ -2,6 +2,7 @@
   "cookie": "在此填入你登录 x-mol.com 后的完整 Cookie 字符串",
   "unpaywall_email": "your_email@example.com",
   "proxy": "",
+  "seen_file": "seen.json",
   "journals": ["Nature", "Science"],
   "keyword": "",
   "days": 7,
