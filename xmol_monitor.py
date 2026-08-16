@@ -69,6 +69,16 @@ def cookie_to_dict(cookie_str):
     return d
 
 
+def get_proxies(cfg):
+    """从配置读取本地代理（如 Clash Verge 的混合端口 7890）。"""
+    p = (cfg.get("proxy") or "").strip()
+    if not p:
+        return None
+    if "://" not in p:
+        p = "http://" + p
+    return {"http": p, "https": p}
+
+
 def safe_filename(name):
     name = re.sub(r'[\\/*?:"<>|]', "_", str(name))
     name = re.sub(r"\s+", " ", name).strip()
@@ -151,11 +161,13 @@ def parse_search_result(html: str):
     return papers
 
 
-def fetch_xmol_papers(cfg, journal, keyword="", days=7, pages=3, debug=False):
+def fetch_xmol_papers(cfg, journal, keyword="", days=7, pages=3, debug=False, proxies=None):
     """通过 XMOL 检索接口抓取指定期刊近 N 天的新文献。"""
     cookies = cookie_to_dict(cfg.get("cookie", ""))
     session = requests.Session()
     session.headers.update(HEADERS)
+    if proxies:
+        session.proxies = proxies
 
     end = datetime.now().date()
     start = end - timedelta(days=days)
@@ -215,11 +227,11 @@ def fetch_xmol_papers(cfg, journal, keyword="", days=7, pages=3, debug=False):
 # --------------------------------------------------------------------------- #
 # 2. 开放获取查询与下载（Unpaywall）
 # --------------------------------------------------------------------------- #
-def query_unpaywall(doi, email):
+def query_unpaywall(doi, email, proxies=None):
     url = f"https://api.unpaywall.org/v2/{doi}"
     params = {"email": email}
     try:
-        resp = requests.get(url, params=params, headers=HEADERS, timeout=30)
+        resp = requests.get(url, params=params, headers=HEADERS, timeout=30, proxies=proxies)
         if resp.status_code == 200:
             return resp.json()
     except requests.RequestException:
@@ -237,10 +249,10 @@ def pick_pdf_url(data):
     return None
 
 
-def download_pdf(url, save_path: Path) -> bool:
+def download_pdf(url, save_path: Path, proxies=None) -> bool:
     try:
         with requests.get(url, headers=HEADERS, timeout=60, stream=True,
-                          allow_redirects=True) as r:
+                          allow_redirects=True, proxies=proxies) as r:
             if r.status_code != 200:
                 return False
             ctype = r.headers.get("Content-Type", "").lower()
@@ -335,6 +347,7 @@ def organize_pdfs(src, dest, index=None, mode="move"):
 # --------------------------------------------------------------------------- #
 def cmd_fetch(args):
     cfg = load_config(args.config)
+    proxies = get_proxies(cfg)
     all_papers = []
     for journal in cfg.get("journals", []):
         print(f"[fetch] 期刊：{journal}")
@@ -344,6 +357,7 @@ def cmd_fetch(args):
             days=cfg.get("days", 7),
             pages=cfg.get("pages", 3),
             debug=args.debug,
+            proxies=proxies,
         )
         if err:
             print(f"  [错误] {err}")
@@ -358,6 +372,7 @@ def cmd_fetch(args):
 
 def cmd_download(args):
     cfg = load_config(args.config)
+    proxies = get_proxies(cfg)
     email = cfg.get("unpaywall_email", "")
     dl_dir = Path(cfg.get("download_dir", "downloads"))
     dl_dir.mkdir(parents=True, exist_ok=True)
@@ -371,6 +386,7 @@ def cmd_download(args):
             days=cfg.get("days", 7),
             pages=cfg.get("pages", 3),
             debug=args.debug,
+            proxies=proxies,
         )
         if err:
             print(f"  [错误] {err}")
@@ -386,7 +402,7 @@ def cmd_download(args):
         item.update({"is_oa": False, "pdf_url": None, "downloaded": False, "file": None})
 
         if doi:
-            data = query_unpaywall(doi, email)
+            data = query_unpaywall(doi, email, proxies=proxies)
             if data:
                 pdf_url = pick_pdf_url(data)
                 item["is_oa"] = bool(pdf_url)
@@ -394,7 +410,7 @@ def cmd_download(args):
                 if pdf_url and cfg.get("download_oa", True):
                     target = dl_dir / f"{safe_filename(p['title'])}.pdf"
                     target = unique_path(target)
-                    ok = download_pdf(pdf_url, target)
+                    ok = download_pdf(pdf_url, target, proxies=proxies)
                     item["downloaded"] = ok
                     if ok:
                         item["file"] = str(target)
