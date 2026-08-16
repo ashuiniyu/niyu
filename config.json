@@ -1,0 +1,11 @@
+{
+  "cookie": "在此填入你登录 x-mol.com 后的完整 Cookie 字符串",
+  "unpaywall_email": "your_email@example.com",
+  "journals": ["Nature", "Science"],
+  "keyword": "",
+  "days": 7,
+  "pages": 3,
+  "download_oa": true,
+  "download_dir": "downloads",
+  "organized_dir": "organized"
+}
