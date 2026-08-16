@@ -239,13 +239,27 @@ class PlaywrightEngine:
             url = f"{url}?{urlencode(params)}"
         with sync_playwright() as p:
             browser = p.chromium.launch(headless=True)
-            ctx = browser.new_context(user_agent=UA)
+            ctx = browser.new_context(user_agent=UA, viewport={"width": 1440, "height": 900})
             ctx.add_cookies(self._cookies())
             page = ctx.new_page()
-            page.goto(url, wait_until="networkidle", timeout=60000)
-            # 滚动加载懒加载内容
-            page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
-            page.wait_for_timeout(1500)
+            page.goto(url, wait_until="domcontentloaded", timeout=60000)
+            # X-MOL 是 Next.js SPA，<main> 初始为空，需等 JS 渲染出文章链接
+            try:
+                page.wait_for_selector("a[href*='/paper/']", timeout=20000)
+            except Exception:
+                # 文章页可能没有内部链接，退而等 main 区域有实质内容
+                try:
+                    page.wait_for_function(
+                        "() => document.querySelector('main') && "
+                        "document.querySelector('main').innerText.trim().length > 50",
+                        timeout=15000,
+                    )
+                except Exception:
+                    self.logger.warning("等待页面渲染超时，可能未登录或为空页: %s", url)
+            # 多次滚动到底，触发懒加载/分页
+            for _ in range(5):
+                page.evaluate("() => window.scrollTo(0, document.body.scrollHeight)")
+                page.wait_for_timeout(800)
             html = page.content()
             browser.close()
             if self.sleep:
